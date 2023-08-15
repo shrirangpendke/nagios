@@ -1,0 +1,78 @@
+The Nagios Plugins Release Process
+
+This document describes the process to release a new version of Nagios Plugins.
+ 
+*** Pre-Release:
+
+Verify that the release branch is not behind master on any commits.  If it is, merge master into release branch first.
+Then merge the release branch into master and push to origin.
+Checkout master, pull, and then build one more time. Check compilation, make all, and make test.
+  
+  $ . tools/devmode (if you are feeling adventurous.) 
+  $ ./configure
+  $ make all
+  $ make test
+
+
+*** Verify Attribution Files:
+
+Make sure all contributors since last release have been added to THANKS.in.
+Update AUTHORS if there are new project members.
+
+
+*** Prepare and Commit Release Files:
+
+Update NEWS file - adhere to the format found in earlier entries.
+Update configure.ac and NP-VERSION-GEN with version:
+NP-VERSION-GEN:
+
+  DEF_VER=x.x.x.git
+
+configure.ac:
+
+  AC_INIT(nagios-plugins,x.x.x)
+
+Commit NEWS, configure.ac, and NP-VERSION-GEN - use the commit message "Prep for x.x.x"
+
+
+*** Create a New Annotated Tag:
+
+  $ git tag -a release-x.x.x -m release-x.x.x
+
+
+*** Push the Code and Tag to Origin:
+
+  $ git push origin master
+  $ git push origin release-x.x.x
+
+
+*** Prepare Tarball for Release:
+
+  $ git pull
+  $ tools/setup
+  $ ./configure
+  $ make dist VERSION="x.x.x"
+
+
+*** New Release Announcement Format:
+
+The standard title/subject and body for a release announcement:
+
+Title/Subject:
+
+  Nagios Plugins x.x.x Released
+
+Body:
+
+  The Nagios Plugins Development Team is proud to announce that nagios-plugins x.x.x has been released and is available for download (http://nagios-plugins.org/downloads/).
+
+  [A short description of the big changes in the release]
+
+  [Release changes from NEWS file]
+
+ 
+*** Announce New Release:
+
+1. Post to: https://nagios-plugins.org/
+2. Post to: https://support.nagios.com/forum/viewforum.php?f=35
+3. Email announcement to mailing list:  nagios-announce@lists.nagios.com

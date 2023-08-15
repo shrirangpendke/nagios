@@ -1,0 +1,676 @@
+#!/usr/bin/perl -w
+#
+# Tool to send git commit notifications
+#
+# Copyright 2005 Alexandre Julliard
+# Copyright 2009-2014 Nagios Plugins Development Team
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 2 of
+# the License, or (at your option) any later version.
+#
+#
+# This script is meant to be called from .git/hooks/post-receive.
+#
+# Usage: git-notify [options] [--] old-sha1 new-sha1 refname
+#
+#   -A        Omit the author name from the mail subject
+#   -C        Show committer in the body if different from the author
+#   -c name   Send CIA notifications under specified project name
+#   -m addr   Send mail notifications to specified address
+#   -n max    Set max number of individual mails to send
+#   -r name   Set the git repository name
+#   -S        Enable compatibility with SourceForge's gitweb URLs
+#   -s bytes  Set the maximum diff size in bytes (-1 for no limit)
+#   -T        Prefix the mail subject with a [repository name] tag
+#   -t file   Prevent duplicate notifications by saving state to this file
+#   -U mask   Set the umask for creating the state file
+#   -u url    Set the URL to the gitweb browser
+#   -i branch If at least one -i is given, report only for specified branches
+#   -x branch Exclude changes to the specified branch from reports
+#   -X        Exclude merge commits
+#   -z        Try to abbreviate the SHA1 name within gitweb URLs (unsafe)
+#
+
+use strict;
+use Fcntl ':flock';
+use Encode qw(encode decode);
+use Cwd 'realpath';
+
+sub git_config($);
+sub get_repos_name();
+
+# some parameters you may want to change
+
+# sendmail's pathname
+my $sendmail = "/usr/sbin/sendmail";
+
+# CIA notification address
+my $cia_address = "cia\@cia.vc";
+
+# debug mode
+my $debug = 0;
+
+# configuration parameters
+
+# omit the author from the mail subject (can be set with the -A option)
+my $omit_author = git_config( "notify.omitauthor" );
+
+# prefix the mail subject with a [repository name] tag (can be set with the -T option)
+my $emit_repo = git_config( "notify.emitrepository" );
+
+# show the committer if different from the author (can be set with the -C option)
+my $show_committer = git_config( "notify.showcommitter" );
+
+# base URL of the gitweb repository browser (can be set with the -u option)
+my $gitweb_url = git_config( "notify.baseurl" );
+
+# abbreviate the SHA1 name within gitweb URLs (can be set with the -z option)
+my $abbreviate_url = git_config( "notify.shorturls" );
+
+# don't report merge commits (can be set with the -X option)
+my $ignore_merges = git_config( "notify.ignoremerges" );
+
+# enable compatibility with SourceForge's gitweb (can be set with the -S option)
+my $sourceforge = git_config( "notify.sourceforge" );
+
+# default repository name (can be changed with the -r option)
+my $repos_name = git_config( "notify.repository" ) || get_repos_name();
+
+# max size of diffs in bytes (can be changed with the -s option)
+my $max_diff_size = git_config( "notify.maxdiff" ) || 10000;
+
+# address for mail notices (can be set with -m option)
+my $commitlist_address = git_config( "notify.mail" );
+
+# project name for CIA notices (can be set with -c option)
+my $cia_project_name = git_config( "notify.cia" );
+
+# max number of individual notices before falling back to a single global notice (can be set with -n option)
+my $max_individual_notices = git_config( "notify.maxnotices" ) || 100;
+
+# branches to include
+my @include_list = split /\s+/, git_config( "notify.include" ) || "";
+
+# branches to exclude
+my @exclude_list = split /\s+/, git_config( "notify.exclude" ) || "";
+
+# the state file we use (can be set with the -t option)
+my $state_file = git_config( "notify.statefile" );
+
+# umask for creating the state file (can be set with -U option)
+my $mode_mask = git_config( "notify.umask" ) || 002;
+
+sub usage()
+{
+    print "Usage: $0 [options] [--] old-sha1 new-sha1 refname\n";
+    print "   -A        Omit the author name from the mail subject\n";
+    print "   -C        Show committer in the body if different from the author\n";
+    print "   -c name   Send CIA notifications under specified project name\n";
+    print "   -m addr   Send mail notifications to specified address\n";
+    print "   -n max    Set max number of individual mails to send\n";
+    print "   -r name   Set the git repository name\n";
+    print "   -S        Enable compatibility with SourceForge's gitweb URLs\n";
+    print "   -s bytes  Set the maximum diff size in bytes (-1 for no limit)\n";
+    print "   -T        Prefix the mail subject with a [repository name] tag\n";
+    print "   -t file   Prevent duplicate notifications by saving state to this file\n";
+    print "   -U mask   Set the umask for creating the state file\n";
+    print "   -u url    Set the URL to the gitweb browser\n";
+    print "   -i branch If at least one -i is given, report only for specified branches\n";
+    print "   -x branch Exclude changes to the specified branch from reports\n";
+    print "   -X        Exclude merge commits\n";
+    print "   -z        Try to abbreviate the SHA1 name within gitweb URLs (unsafe)\n";
+    exit 1;
+}
+
+sub xml_escape($)
+{
+    my $str = shift;
+    $str =~ s/&/&amp;/g;
+    $str =~ s/</&lt;/g;
+    $str =~ s/>/&gt;/g;
+    my @chars = unpack "U*", $str;
+    $str = join "", map { ($_ > 127) ? sprintf "&#%u;", $_ : chr($_); } @chars;
+    return $str;
+}
+
+# execute git-rev-list(1) with the given parameters and return the output
+sub git_rev_list(@)
+{
+    my @args = @_;
+    my $revlist = [];
+    my $pid = open REVLIST, "-|";
+
+    die "Cannot open pipe: $!" if not defined $pid;
+    if (!$pid)
+    {
+        exec "git", "rev-list", "--reverse", @args or die "Cannot execute rev-list: $!";
+    }
+    while (<REVLIST>)
+    {
+        chomp;
+        unless (grep {$_ eq "--pretty"} @args)
+        {
+            die "Invalid commit: $_" if not /^[0-9a-f]{40}$/;
+        }
+        push @$revlist, $_;
+    }
+    close REVLIST or die $! ? "Cannot execute rev-list: $!" : "rev-list exited with status: $?";
+    return $revlist;
+}
+
+# append the given commit hashes to the state file
+sub save_commits($)
+{
+    my $commits = shift;
+
+    open STATE, ">>", $state_file or die "Cannot open $state_file: $!";
+    flock STATE, LOCK_EX or die "Cannot lock $state_file";
+    print STATE "$_\n" for @$commits;
+    flock STATE, LOCK_UN or die "Cannot unlock $state_file";
+    close STATE or die "Cannot close $state_file: $!";
+}
+
+# for the given range, return the new hashes (and append them to the state file)
+sub get_new_commits($$)
+{
+    my ($old_sha1, $new_sha1) = @_;
+    my ($seen, @args);
+    my $newrevs = [];
+
+    @args = ( "^$old_sha1" ) unless $old_sha1 eq '0' x 40;
+    push @args, $new_sha1, @exclude_list;
+    unshift @args, "--no-merges" if $ignore_merges;
+
+    my $revlist = git_rev_list(@args);
+
+    if (not defined $state_file or not -e $state_file)
+    {
+        save_commits(git_rev_list("--all", "--full-history")) if defined $state_file;
+        return $revlist;
+    }
+
+    open STATE, $state_file or die "Cannot open $state_file: $!";
+    flock STATE, LOCK_SH or die "Cannot lock $state_file";
+    while (<STATE>)
+    {
+        chomp;
+        die "Invalid commit: $_" if not /^[0-9a-f]{40}$/;
+        $seen->{$_} = 1;
+    }
+    flock STATE, LOCK_UN or die "Cannot unlock $state_file";
+    close STATE or die "Cannot close $state_file: $!";
+
+    # FIXME: if another git-notify process reads the $state_file at *this*
+    # point, that process might generate duplicates of our notifications.
+
+    save_commits($revlist);
+
+    foreach my $commit (@$revlist)
+    {
+        push @$newrevs, $commit unless $seen->{$commit};
+    }
+    return $newrevs;
+}
+
+# truncate the given string if it exceeds the specified number of characters
+sub truncate_str($$)
+{
+    my ($str, $max) = @_;
+
+    if (length($str) > $max)
+    {
+        $str = substr($str, 0, $max);
+        $str =~ s/\s+\S+$//;
+        $str .= " ...";
+    }
+    return $str;
+}
+
+# right-justify the left column of "left: right" elements, omit undefined elements
+sub format_table(@)
+{
+    my @lines = @_;
+    my @table;
+    my $max = 0;
+
+    foreach my $line (@lines)
+    {
+       next if not defined $line;
+       my $pos = index($line, ":");
+
+       $max = $pos if $pos > $max;
+    }
+
+    foreach my $line (@lines)
+    {
+       next if not defined $line;
+       my ($left, $right) = split(/: */, $line, 2);
+
+       push @table, (defined $left and defined $right)
+           ? sprintf("%*s: %s", $max + 1, $left, $right)
+           : $line;
+    }
+    return @table;
+}
+
+# format an integer date + timezone as string
+# algorithm taken from git's date.c
+sub format_date($$)
+{
+    my ($time,$tz) = @_;
+
+    if ($tz < 0)
+    {
+        my $minutes = (-$tz / 100) * 60 + (-$tz % 100);
+        $time -= $minutes * 60;
+    }
+    else
+    {
+        my $minutes = ($tz / 100) * 60 + ($tz % 100);
+        $time += $minutes * 60;
+    }
+    return gmtime($time) . sprintf " %+05d", $tz;
+}
+
+# fetch a parameter from the git config file
+sub git_config($)
+{
+    my ($param) = @_;
+
+    open CONFIG, "-|" or exec "git", "config", $param;
+    my $ret = <CONFIG>;
+    chomp $ret if $ret;
+    close CONFIG or $ret = undef;
+    return $ret;
+}
+
+# parse command line options
+sub parse_options()
+{
+    while (@ARGV && $ARGV[0] =~ /^-/)
+    {
+        my $arg = shift @ARGV;
+
+        if ($arg eq '--') { last; }
+        elsif ($arg eq '-A') { $omit_author = 1; }
+        elsif ($arg eq '-C') { $show_committer = 1; }
+        elsif ($arg eq '-c') { $cia_project_name = shift @ARGV; }
+        elsif ($arg eq '-m') { $commitlist_address = shift @ARGV; }
+        elsif ($arg eq '-n') { $max_individual_notices = shift @ARGV; }
+        elsif ($arg eq '-r') { $repos_name = shift @ARGV; }
+        elsif ($arg eq '-S') { $sourceforge = 1; }
+        elsif ($arg eq '-s') { $max_diff_size = shift @ARGV; }
+        elsif ($arg eq '-T') { $emit_repo = 1; }
+        elsif ($arg eq '-t') { $state_file = shift @ARGV; }
+        elsif ($arg eq '-U') { $mode_mask = shift @ARGV; }
+        elsif ($arg eq '-u') { $gitweb_url = shift @ARGV; }
+        elsif ($arg eq '-i') { push @include_list, shift @ARGV; }
+        elsif ($arg eq '-X') { $ignore_merges = 1; }
+        elsif ($arg eq '-x') { push @exclude_list, shift @ARGV; }
+        elsif ($arg eq '-z') { $abbreviate_url = 1; }
+        elsif ($arg eq '-d') { $debug++; }
+        else { usage(); }
+    }
+    if (@ARGV && $#ARGV != 2) { usage(); }
+    @exclude_list = map { "^$_"; } @exclude_list;
+}
+
+# send an email notification
+sub mail_notification($$$@)
+{
+    my ($name, $subject, $content_type, @text) = @_;
+
+    $subject = "[$repos_name] $subject" if ($emit_repo and $name ne $cia_address);
+    $subject = encode("MIME-Q",$subject);
+
+    my @header = ("To: $name", "Subject: $subject", "Content-Type: $content_type");
+
+    if ($debug)
+    {
+        binmode STDOUT, ":utf8";
+        print "---------------------\n";
+        print join("\n", @header), "\n\n", join("\n", @text), "\n";
+    }
+    else
+    {
+        my $pid = open MAIL, "|-";
+        return unless defined $pid;
+        if (!$pid)
+        {
+            exec $sendmail, "-t", "-oi", "-oem" or die "Cannot exec $sendmail";
+        }
+        binmode MAIL, ":utf8";
+        print MAIL join("\n", @header), "\n\n", join("\n", @text), "\n";
+        close MAIL or warn $! ? "Cannot execute $sendmail: $!" : "$sendmail exited with status: $?";
+    }
+}
+
+# get the default repository name
+sub get_repos_name()
+{
+    my $dir = `git rev-parse --git-dir`;
+    chomp $dir;
+    my $repos = realpath($dir);
+    $repos =~ s/(.*?)((\.git\/)?\.git)$/$1/;
+    $repos =~ s/(.*)\/([^\/]+)\/?$/$2/;
+    return $repos;
+}
+
+# return the type of the given object
+sub get_object_type($)
+{
+    my $obj = shift;
+
+    open TYPE, "-|" or exec "git", "cat-file", "-t", $obj or die "cannot run git-cat-file";
+    my $type = <TYPE>;
+    chomp $type;
+    close TYPE or die $! ? "Cannot execute cat-file: $!" : "cat-file exited with status: $?";
+    return $type;
+}
+
+# extract the information from a commit or tag object and return a hash containing the various fields
+sub get_object_info($)
+{
+    my $obj = shift;
+    my %info = ();
+    my @log = ();
+    my $do_log = 0;
+
+    $info{"encoding"} = "utf-8";
+
+    my $type = get_object_type($obj);
+
+    open OBJ, "-|" or exec "git", "cat-file", $type, $obj or die "cannot run git-cat-file";
+    while (<OBJ>)
+    {
+        chomp;
+        if ($do_log)
+        {
+            last if /^-----BEGIN PGP SIGNATURE-----/;
+            push @log, $_;
+        }
+        elsif (/^(author|committer|tagger) ((.*) (<.*>)) (\d+) ([+-]\d+)$/)
+        {
+            $info{$1} = $2;
+            $info{$1 . "_name"} = $3;
+            $info{$1 . "_email"} = $4;
+            $info{$1 . "_date"} = $5;
+            $info{$1 . "_tz"} = $6;
+        }
+        elsif (/^tag (.+)/)
+        {
+            $info{"tag"} = $1;
+        }
+        elsif (/^encoding (.+)/)
+        {
+            $info{"encoding"} = $1;
+        }
+        elsif (/^$/) { $do_log = 1; }
+    }
+    close OBJ or die $! ? "Cannot execute cat-file: $!" : "cat-file exited with status: $?";
+
+    $info{"type"} = $type;
+    $info{"log"} = \@log;
+    return %info;
+}
+
+# send a ref change notice to a mailing list
+sub send_ref_notice($$@)
+{
+    my ($ref, $action, @notice) = @_;
+    my ($reftype, $refname) = ($ref =~ /^refs\/(head|tag)s\/(.+)/);
+
+    $reftype =~ s/^head$/branch/;
+
+    @notice = (format_table(
+        "Module: $repos_name",
+        ($reftype eq "tag" ? "Tag:" : "Branch:") . $refname,
+        @notice,
+        ($action ne "removed" and $gitweb_url)
+            ? "URL: ${gitweb_url}a=shortlog;h=$ref" : undef),
+        "",
+        "The $refname $reftype has been $action.");
+
+    mail_notification($commitlist_address, "$refname $reftype $action",
+        "text/plain; charset=us-ascii", @notice);
+}
+
+# send a commit notice to a mailing list
+sub send_commit_notice($$)
+{
+    my ($ref,$obj) = @_;
+    my %info = get_object_info($obj);
+    my @notice = ();
+    my ($url,$subject,$obj_string);
+
+    if ($gitweb_url)
+    {
+        if ($abbreviate_url)
+        {
+            open REVPARSE, "-|" or exec "git", "rev-parse", "--short", $obj or die "cannot exec git-rev-parse";
+            $obj_string = <REVPARSE>;
+            chomp $obj_string if defined $obj_string;
+            close REVPARSE or die $! ? "Cannot execute rev-parse: $!" : "rev-parse exited with status: $?";
+        }
+        $obj_string = $obj if not defined $obj_string;
+        $url = "${gitweb_url}a=$info{type};h=$obj_string";
+    }
+
+    if ($info{"type"} eq "tag")
+    {
+        push @notice, format_table(
+          "Module: $repos_name",
+          "Tag: $ref",
+          "SHA1: $obj",
+          "Tagger:" . $info{"tagger"},
+          "Date:" . format_date($info{"tagger_date"},$info{"tagger_tz"}),
+          $url ? "URL: $url" : undef),
+          "",
+          join "\n", @{$info{"log"}};
+
+        $subject = "Tag " . $info{"tag"} . ": ";
+        $subject .= $info{"tagger_name"} . ": " unless $omit_author;
+    }
+    else
+    {
+        push @notice, format_table(
+          "Module: $repos_name",
+          "Branch: $ref",
+          "Commit: $obj",
+          "Author:" . $info{"author"},
+          $show_committer && $info{"committer"} ne $info{"author"} ? "Committer:" . $info{"committer"} : undef,
+          "Date:" . format_date($info{"author_date"},$info{"author_tz"}),
+          $url ? "URL: $url" : undef),
+          "",
+          @{$info{"log"}},
+          "",
+          "---",
+          "";
+
+        open STAT, "-|" or exec "git", "diff-tree", "--stat", "-M", "--no-commit-id", $obj or die "cannot exec git-diff-tree";
+        push @notice, join("", <STAT>);
+        close STAT or die $! ? "Cannot execute diff-tree: $!" : "diff-tree exited with status: $?";
+
+        open DIFF, "-|" or exec "git", "diff-tree", "-p", "-M", "--no-commit-id", $obj or die "cannot exec git-diff-tree";
+        my $diff = join("", <DIFF>);
+        close DIFF or die $! ? "Cannot execute diff-tree: $!" : "diff-tree exited with status: $?";
+
+        if (($max_diff_size == -1) || (length($diff) < $max_diff_size))
+        {
+            push @notice, $diff;
+        }
+        else
+        {
+            push @notice, "Diff: ${gitweb_url}a=commitdiff;h=$obj_string" if $gitweb_url;
+        }
+        $subject = $info{"author_name"} . ": " unless $omit_author;
+    }
+
+    $subject .= truncate_str(${$info{"log"}}[0],50);
+    $_ = decode($info{"encoding"}, $_) for @notice;
+    mail_notification($commitlist_address, $subject, "text/plain; charset=UTF-8", @notice);
+}
+
+# send a commit notice to the CIA server
+sub send_cia_notice($$)
+{
+    my ($ref,$commit) = @_;
+    my %info = get_object_info($commit);
+    my @cia_text = ();
+
+    return if $info{"type"} ne "commit";
+
+    push @cia_text,
+        "<message>",
+        "  <generator>",
+        "    <name>git-notify script for CIA</name>",
+        "  </generator>",
+        "  <source>",
+        "    <project>" . xml_escape($cia_project_name) . "</project>",
+        "    <module>" . xml_escape($repos_name) . "</module>",
+        "    <branch>" . xml_escape($ref). "</branch>",
+        "  </source>",
+        "  <body>",
+        "    <commit>",
+        "      <revision>" . substr($commit,0,10) . "</revision>",
+        "      <author>" . xml_escape($info{"author"}) . "</author>",
+        "      <log>" . xml_escape(join "\n", @{$info{"log"}}) . "</log>",
+        "      <files>";
+
+    open COMMIT, "-|" or exec "git", "diff-tree", "--name-status", "-r", "-M", $commit or die "cannot run git-diff-tree";
+    while (<COMMIT>)
+    {
+        chomp;
+        if (/^([AMD])\t(.*)$/)
+        {
+            my ($action, $file) = ($1, $2);
+            my %actions = ( "A" => "add", "M" => "modify", "D" => "remove" );
+            next unless defined $actions{$action};
+            push @cia_text, "        <file action=\"$actions{$action}\">" . xml_escape($file) . "</file>";
+        }
+        elsif (/^R\d+\t(.*)\t(.*)$/)
+        {
+            my ($old, $new) = ($1, $2);
+            push @cia_text, "        <file action=\"rename\" to=\"" . xml_escape($new) . "\">" . xml_escape($old) . "</file>";
+        }
+    }
+    close COMMIT or die $! ? "Cannot execute diff-tree: $!" : "diff-tree exited with status: $?";
+
+    push @cia_text,
+        "      </files>",
+        $gitweb_url ? "      <url>" . xml_escape("${gitweb_url}a=commit;h=$commit") . "</url>" : "",
+        "    </commit>",
+        "  </body>",
+        "  <timestamp>" . $info{"author_date"} . "</timestamp>",
+        "</message>";
+
+    mail_notification($cia_address, "DeliverXML", "text/xml", @cia_text);
+}
+
+# send a global commit notice when there are too many commits for individual mails
+sub send_global_notice($$$)
+{
+    my ($ref, $old_sha1, $new_sha1) = @_;
+    my $notice = git_rev_list("--pretty", "^$old_sha1", "$new_sha1", @exclude_list);
+
+    foreach my $rev (@$notice)
+    {
+        $rev =~ s/^commit /URL:    ${gitweb_url}a=commit;h=/ if $gitweb_url;
+    }
+
+    mail_notification($commitlist_address, "New commits on branch $ref", "text/plain; charset=UTF-8", @$notice);
+}
+
+# send all the notices
+sub send_all_notices($$$)
+{
+    my ($old_sha1, $new_sha1, $ref) = @_;
+    my ($reftype, $refname, $tagtype, $action, @notice);
+
+    return if ($ref =~ /^refs\/remotes\//
+        or (@include_list && !grep {$_ eq $ref} @include_list));
+    die "The name \"$ref\" doesn't sound like a local branch or tag"
+        if not (($reftype, $refname) = ($ref =~ /^refs\/(head|tag)s\/(.+)/));
+
+    if ($reftype eq "tag")
+    {
+        $tagtype = get_object_type($ref) eq "tag" ? "annotated" : "lightweight";
+    }
+
+    if ($new_sha1 eq '0' x 40)
+    {
+        $action = "removed";
+        @notice = ( "Old SHA1: $old_sha1" );
+    }
+    elsif ($old_sha1 eq '0' x 40)
+    {
+        if ($reftype eq "tag" and $tagtype eq "annotated")
+        {
+            send_commit_notice( $refname, $new_sha1 ) if $commitlist_address;
+            return;
+        }
+        $action = "created";
+        @notice = ( "SHA1: $new_sha1" );
+    }
+    elsif ($reftype eq "tag")
+    {
+        $action = "updated";
+        @notice = ( "Old SHA1: $old_sha1", "New SHA1: $new_sha1" );
+    }
+    elsif (not grep( $_ eq $old_sha1, @{ git_rev_list( $new_sha1, "--full-history" ) } ))
+    {
+        $action = "rewritten";
+        @notice = ( "Old SHA1: $old_sha1", "New SHA1: $new_sha1" );
+    }
+
+    send_ref_notice( $ref, $action, @notice ) if ($commitlist_address and $action);
+
+    unless ($reftype eq "tag" or $new_sha1 eq '0' x 40)
+    {
+        my $commits = get_new_commits ( $old_sha1, $new_sha1 );
+
+        if (@$commits > $max_individual_notices)
+        {
+            send_global_notice( $refname, $old_sha1, $new_sha1 ) if $commitlist_address;
+        }
+        elsif (@$commits > 0)
+        {
+            foreach my $commit (@$commits)
+            {
+                send_commit_notice( $refname, $commit ) if $commitlist_address;
+                send_cia_notice( $refname, $commit ) if $cia_project_name;
+            }
+        }
+        elsif ($commitlist_address)
+        {
+            @notice = ( "Old SHA1: $old_sha1", "New SHA1: $new_sha1" );
+            send_ref_notice( $ref, "modified", @notice );
+        }
+    }
+}
+
+parse_options();
+
+umask( $mode_mask );
+
+# append repository path to URL
+if ($gitweb_url) {
+    $gitweb_url .= $sourceforge ? "/$repos_name;" : "/$repos_name.git/?";
+}
+
+if (@ARGV)
+{
+    send_all_notices( $ARGV[0], $ARGV[1], $ARGV[2] );
+}
+else  # read them from stdin
+{
+    while (<>)
+    {
+        chomp;
+        if (/^([0-9a-f]{40}) ([0-9a-f]{40}) (.*)$/) { send_all_notices( $1, $2, $3 ); }
+    }
+}
+
+exit 0;

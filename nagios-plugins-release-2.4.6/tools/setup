@@ -1,0 +1,54 @@
+#!/bin/sh
+#
+# autogen.sh glue from CMU Cyrus IMAP
+#
+# Requires: automake, autoconf, dpkg-dev
+# set -e
+
+MAKE=`which gnumake`
+if test ! -x "$MAKE" ; then MAKE=`which gmake` ; fi
+if test ! -x "$MAKE" ; then MAKE=`which make` ; fi
+HAVE_GNU_MAKE=`$MAKE --version|grep -c "Free Software Foundation"`
+
+if test "$HAVE_GNU_MAKE" != "1"; then 
+	echo Could not find GNU make on this system, can not proceed with build.
+	exit 1
+else
+	echo Found GNU Make at $MAKE ... good.
+fi
+
+# This bit is to fix SF's compile server as libtool not installed by default
+extra=""
+if test -d $HOME/share/aclocal ; then
+	extra="-I $HOME/share/aclocal"
+fi
+
+# This file will be automagically re-generated of present - still looks
+# better than having a versioned file change based on automake version
+touch build-aux/mkinstalldirs
+
+aclocal -I gl/m4 -I m4 $extra
+#libtoolize --force --copy
+autoheader
+automake --add-missing --force-missing --copy
+autoconf
+
+if [ -f debian/rules ] ; then
+  chmod +x debian/rules
+fi
+
+# Lots of fiddling as Solaris' which command does give error if which fails
+docbook=0
+if [ `uname -s` = "SunOS" ] ; then
+	if [ "`which docbook2html`" = "/"* ] ; then
+		docbook=1
+	fi
+else
+	if which docbook2html >/dev/null 2>&1; then
+		docbook=1
+	fi
+fi
+
+if [ $docbook = 1 ] ; then
+	( cd doc && make )
+fi

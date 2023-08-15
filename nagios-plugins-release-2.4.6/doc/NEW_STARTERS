@@ -1,0 +1,14 @@
+NEW STARTERS
+
+These are the steps for adding someone to the team.
+
+Need to know:
+  - Name
+  - Primary email for the relevant mailing lists, accounts, etc.
+  - GitHub account
+  - Type of member (translator, developer, release manager, project administrator)
+
+1. Grant Contributor access to Github https://github.com/nagios-plugins
+2. Update team members at: https://nagios-plugins.org/team/ 
+3. Send and email introducing new member nagios-announce@lists.nagios.com
+4. Grant Member access to coverity https://scan.coverity.com/projects/2376
