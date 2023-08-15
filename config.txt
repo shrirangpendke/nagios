@@ -1,8 +1,8 @@
 # config.txt
-client1_file=newclient1.cfg
-client1_name=myclient1
-client1_hostname=worker-A
-client1_ip=192.168.56.11
+client1_file=newclient2.cfg
+client1_name=myclient2
+client1_hostname=worker-B
+client1_ip=192.168.56.20
 
 client2_file=newclient2.cfg
 client2_name=myclient2
