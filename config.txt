@@ -1,1 +1,2 @@
-pycontainer1.cfg lab-container-1 flask 192.168.0.140:8090
+pycontainer1.cfg lab-container-1 flask 172.17.0.2
+hostOS1.cfg hostOS hostOS 192.168.0.140 
