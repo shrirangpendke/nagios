@@ -1,1 +1,1 @@
-hostOS.cfg linux host0S 192.168.56.1
+hostOS1.cfg linux host0S 192.168.0.140
